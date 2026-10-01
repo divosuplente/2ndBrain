@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-ingest-channel
-description: "Batch-fetch ALL transcripts from a YouTube channel and ingest them into the OKF brain. Triggered when user says \"ingest this channel\", \"fetch channel transcripts\", or provides a YouTube channel handle (@ChannelHandle). Implements 8-phase extraction pipeline. NOT for single videos — use okf-ingest. NOT for folders of files — use okf-batch-ingest. NOT for textbooks — use okf-book-ingest."
+description: "Batch-fetch ALL transcripts from a YouTube channel and ingest them into the OKF brain."
 ---
 
 # OKF Ingest Channel — Batch YouTube Channel Ingest

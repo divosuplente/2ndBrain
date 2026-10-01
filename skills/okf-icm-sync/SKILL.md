@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-icm-sync
-description: "Sync OKF ICM orientation files (IDENTITY.md, CONTEXT.md) with the live vault. Triggered only by explicit user request: \"rebuild ICM routing\", \"sync skill routing\", \"refresh ICM\", or \"align agent entrypoints\". Updates routing rows in CONTEXT.md and map table in IDENTITY.md against actual skills/ and top-level directories. NOT auto-triggered by file changes."
+description: "Sync OKF ICM orientation files (IDENTITY.md, CONTEXT.md) with the live vault."
 ---
 
 # okf-icm-sync

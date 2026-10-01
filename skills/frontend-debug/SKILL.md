@@ -1,7 +1,7 @@
 ---
 type: skill
 name: frontend-debug
-description: "Debug or verify frontend behavior by driving a live page (DOM, storage, network, console) with OMP's browser tool instead of reading source. Use for broken auth, 401/CORS, session drift, blank screens, form failures, or verifying UI changes."
+description: "Debug or verify frontend behavior by driving a live page (DOM, storage, network, console) with OMP's browser tool instead of reading source."
 ---
 
 # Frontend Debugging via Live Page

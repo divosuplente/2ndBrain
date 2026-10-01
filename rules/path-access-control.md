@@ -10,18 +10,21 @@ Define which paths agents may access by default, and which require explicit user
 **Allowed Paths (read/write)**
 
 - `skills/` – usable agent skills (includes stage contracts under `skills/*/stages/`)
-- `inbox/` – temporary ingest staging
 - `concepts/` – OKF concept files (the vault's core content)
+- `inbox/` – temporary ingest staging
 - `tools/` – CLI tooling (`okf.py`, `ingest.py`, migration scripts)
 - `provenance/` – provenance maps and generated artifacts
 - `_config/` – ICM short reference slices (conventions, glossary)
 - `themes/` – cross-domain synthesis overlays
 - `specs/` – feature specs
 - `books/` – per-chapter book slices + formula snapshots (committed reference material; originals stay outside the repo)
+- `teaching/` – OKF teach workspaces (`_MISSION.md`, `_LEARNING-PATH.md`, `lessons/`, `assets/`)
 - `.omp/` – project-local OMP extensions
 - `~/.omp/` – global OMP configuration and extensions
 - `~/.agents/` – global agent harness skills and rules
 - `rules/` – agent path/policy rules (this file)
+- `./` – vault root (repo-root scripts and files: `teach`, `README.md`, `ADOPTIONS.md`, etc.)
+- `.github/`
 - `IDENTITY.md`, `CONTEXT.md`, `AGENTS.md`, `decisions.md` – orientation + contract + decisions
 - `log.md` – vault change log
 - `index.md` – vault catalog (prefer `okf.py index` to regenerate; hand-edits will be overwritten)

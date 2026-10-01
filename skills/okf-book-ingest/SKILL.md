@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-book-ingest
-description: "Convert textbook chapters into OKF concepts using book-to-skill. Triggered when user says \"ingest this book/textbook\", \"convert chapter\", \"book to skill\", or \"study this chapter from [book]\". One chapter at a time. NOT for single URLs — use okf-ingest. NOT for folders — use okf-batch-ingest. NOT for YouTube channels — use okf-ingest-channel."
+description: "Convert textbook chapters into OKF concepts using book-to-skill."
 ---
 
 # OKF Book Ingest Skill

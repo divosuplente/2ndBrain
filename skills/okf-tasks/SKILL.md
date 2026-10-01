@@ -1,10 +1,7 @@
 ---
 type: skill
 name: okf-tasks
-description: >
-  Durable cross-session task tracking for the OKF vault. Files in tasks/
-  with structured frontmatter. Lifecycle: open → in-progress → done/YYYY/MM/
-  or cancelled/YYYY/MM/. Cross-references to concepts and skills.
+description: "Durable cross-session task tracking for OKF vault. Lifecycle: open → in-progress → done/cancelled."
 ---
 
 # okf-tasks

@@ -1,7 +1,7 @@
 ---
 type: skill
 name: visualize
-description: Add diagrams and visual explanations to lessons when a picture carries information prose cannot
+description: "Add diagrams and visual explanations to lessons when a picture carries information prose cannot"
 ---
 
 ## When to use

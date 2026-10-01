@@ -1,7 +1,7 @@
 ---
 type: skill
 name: snippets
-description: Quick behavioral snippets activated via /snippet commands. Injects into system prompt every turn until cleared.
+description: "Quick behavioral snippets activated via /snippet commands. Injects into system prompt every turn until cleared."
 ---
 
 # Snippets

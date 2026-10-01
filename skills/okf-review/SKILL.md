@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-review
-description: "Spaced-repetition review engine for OKF learning concepts. Triggered when user says \"spaced repetition\", \"SRS session\", \"what's due for review\", \"review queue\", or \"recall practice\". Pulls concepts past their review interval, presents active recall exercises, and updates intervals based on recall scores. NOT for searching, querying, or general knowledge lookup — use okf-query for that."
+description: "Spaced-repetition review engine for OKF learning concepts. Triggered on 'spaced repetition', 'SRS session', 'what's due'."
 ---
 
 # OKF Review Skill

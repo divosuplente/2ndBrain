@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# Check upstream OKF spec repo for recent changes to the okf/ directory.
+# Check upstream OKF spec repo for recent commits.
 # Usage: bash tools/check-okf-upstream.sh
+#
+# The spec lives in its own repo since 2026-08-21 (moved out of
+# GoogleCloudPlatform/knowledge-catalog, where the okf/ directory
+# was archived with a pointer to this repo).
 set -euo pipefail
 
-curl -sL "https://api.github.com/repos/GoogleCloudPlatform/knowledge-catalog/commits?path=okf&per_page=5" | python3 -c "
+REPO="GoogleCloudPlatform/open-knowledge-format"
+
+curl -sL "https://api.github.com/repos/${REPO}/commits?per_page=5" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 if isinstance(data, dict) and 'message' in data:

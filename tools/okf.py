@@ -4,25 +4,39 @@
 Subcommands:
   index        Walk concepts/, build tools/index.json, and regenerate provenance/map.{json,md}.
   search       Rank concepts for a query (BM25) with optional --visibility/--type/--domain filters.
-  lint         Report missing required frontmatter, broken links, orphans, duplicates, privacy issues.
+  lint         Report missing required frontmatter, broken links, orphans, duplicates, privacy and tag-convention issues.
+  backlinks    List concepts with inbound links to one concept (id, path, or unique slug).
+  affected     Transitive inbound links (what would need review if X changes); --git BASE seeds from diff.
   relink       Rewrite intra-corpus markdown links to canonical /concepts/<id>.md paths.
   sql          Run ad-hoc SQL queries over the corpus (requires: pip install "okf-tools[sql]").
   doctor       Agent-surface integrity (ICM files, AGENTS dup, AAAK parity, routing).
   icm-sync     Diff skills/ vs CONTEXT routing; optional --write.
+  log          Verify the hash chain over log.md; --seal folds in new appends, --bootstrap first-run seal.
+  status       Single gate: lint + doctor + log chain → READY / NEEDS ATTENTION / BLOCKED.
+  export       Export shareable concepts + their referenced raw/attachments (private never exported).
   view         Build the index, serve locally, and open the graph viewer in a browser.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import os
 import re
 import shutil
 import sys
+import subprocess
 import tempfile
 from datetime import datetime, timezone
+from fnmatch import fnmatch
+from hashlib import sha256
 from pathlib import Path
+from urllib.parse import unquote
+from xml.sax.saxutils import escape as _xml_escape
+
+import okf_normalize_dates
 
 # --- repo layout -----------------------------------------------------------
 
@@ -38,9 +52,13 @@ REQUIRED_FIELDS = ("type", "visibility")
 VALID_VISIBILITY = ("private", "shareable")
 PERSONAL_DOMAINS = {"life", "people", "orgs", "documents", "work"}  # default private (D-015)
 LOOPBACK = "127.0.0.1"  # local-only bind host for `okf view`
+LOG_PATH = REPO_ROOT / "log.md"
+LOG_STATE = REPO_ROOT / "log.chain.jsonl"  # committed — external anchor for the log seal
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+# attachment refs in concept bodies: markdown / HTML / bare links to raw/attachments/<name>
+_ATTACH_REF_RE = re.compile(r"raw/attachments/([^)\s>'\"`]*)")
 _FM_KEY_RE = re.compile(r"^([A-Za-z_][\w-]*):\s*(.*)$")
 _FM_ITEM_RE = re.compile(r"^\s*-\s+(.*)$")
 
@@ -363,8 +381,36 @@ def cmd_search(args):
 
 # --- lint ------------------------------------------------------------------
 
+VALID_STATUS = ("active", "dormant", "archived")
+_V02_STATUS = {"stable", "draft", "deprecated"}  # spec v0.2 values the vault retired
+_ACTOR_RE = re.compile(r"^(?:human|agent|process):[A-Za-z0-9._-]+$")
+_GEN_AT_RE = re.compile(r"at:\s*([^,}\s]+)")
+_GEN_BY_RE = re.compile(r"by:\s*([^,}\s]+)")
+_ISO_FULL = okf_normalize_dates.ISO_FULL  # keep in sync with tools/okf_normalize_dates.py
+
+def _fm_actors(generated, verified):
+    """Yield parseable actor slugs from generated/verified frontmatter values."""
+    if isinstance(generated, dict):
+        by = generated.get("by")
+        if by:
+            yield str(by)
+    elif isinstance(generated, str):
+        m = _GEN_BY_RE.search(generated)
+        if m:
+            yield m.group(1)
+    for item in as_list(verified):
+        if isinstance(item, dict):
+            by = item.get("by")
+            if by:
+                yield str(by)
+        elif isinstance(item, str):
+            m = _GEN_BY_RE.search(item)
+            if m:
+                yield m.group(1)
+
 def lint_concepts(concepts):
     findings = []
+    tag_counts: dict = {}
     ids = {c.id for c in concepts}
     inbound: dict = {c.id: 0 for c in concepts}
     titles: dict = {}
@@ -383,6 +429,31 @@ def lint_concepts(concepts):
         if domain in PERSONAL_DOMAINS and vis == "shareable":
             findings.append({"level": "warn", "concept": c.id, "kind": "privacy",
                              "detail": f"personal domain `{domain}` is shareable — confirm override is intentional"})
+        # tag conventions (contract: ≥1 tag; lowercase-hyphenated; no domain- or clippings-redundant)
+        tags = c.fm.get("tags") or []
+        if not tags:
+            findings.append({"level": "info", "concept": c.id, "kind": "missing-tag",
+                             "detail": "no tags (contract: at least one per concept)"})
+        else:
+            dom_forms = set()
+            if domain:
+                dom_forms.add(domain)
+                dom_forms.add(domain[:-1] if domain.endswith("s") and len(domain) > 3 else domain + "s")
+            for t in tags:
+                ts = t.strip() if isinstance(t, str) else None
+                if ts is None or ts.startswith("- "):
+                    findings.append({"level": "warn", "concept": c.id, "kind": "malformed-tag",
+                                     "detail": f"tag {t!r} is not a flat scalar (likely a malformed `- - ` block entry)"})
+                    continue
+                if not ts:
+                    continue
+                tag_counts[ts] = tag_counts.get(ts, 0) + 1
+                if ts != ts.lower() or "_" in ts or "--" in ts or ts == "clippings":
+                    findings.append({"level": "warn", "concept": c.id, "kind": "bad-tag",
+                                     "detail": f"tag `{ts}` breaks convention (lowercase, hyphenated, no underscore/clippings)"})
+                if ts in dom_forms:
+                    findings.append({"level": "info", "concept": c.id, "kind": "domain-tag",
+                                     "detail": f"tag `{ts}` is redundant with domain `{domain}`"})
         title = (c.fm.get("title") or "").strip().lower()
         if title:
             titles.setdefault(title, []).append(c.id)
@@ -393,6 +464,49 @@ def lint_concepts(concepts):
                 findings.append({"level": "warn", "concept": c.id, "kind": "broken-link",
                                  "detail": f"links to missing concept `{target}`"})
 
+        # status vocabulary (vault extension: active|dormant|archived)
+        status = c.fm.get("status")
+        if status and not isinstance(status, str):
+            findings.append({"level": "error", "concept": c.id, "kind": "bad-status",
+                             "detail": f"status {status!r} is not a flat scalar"})
+        elif status and status not in VALID_STATUS:
+            detail = f"status `{status}` not in {VALID_STATUS}"
+            if status in _V02_STATUS:
+                detail += " (okf v0.2 value — vault uses active|dormant|archived)"
+            findings.append({"level": "error", "concept": c.id, "kind": "bad-status",
+                             "detail": detail})
+        # trust: verified must be {by,at} events; trust_tier is a retired local extension
+        verified = c.fm.get("verified")
+        if verified and not isinstance(verified, list):
+            findings.append({"level": "warn", "concept": c.id, "kind": "malformed-trust",
+                             "detail": f"`verified` must be a list of events ({{by, at}}), got {verified!r}"})
+        if "trust_tier" in c.fm:
+            findings.append({"level": "warn", "concept": c.id, "kind": "malformed-trust",
+                             "detail": "`trust_tier` is a non-conformant local extension (spec §5.3 uses verified events)"})
+        # generated.at must be ISO-8601 with explicit offset (spec §5)
+        generated = c.fm.get("generated")
+        if generated:
+            if isinstance(generated, dict):
+                gen_at = generated.get("at")
+            else:
+                m = _GEN_AT_RE.search(str(generated))
+                gen_at = m.group(1) if m else None
+            if not gen_at:
+                findings.append({"level": "warn", "concept": c.id, "kind": "bad-generated-at",
+                                 "detail": "generated without at"})
+            elif not _ISO_FULL.match(str(gen_at)):
+                findings.append({"level": "warn", "concept": c.id, "kind": "bad-generated-at",
+                                 "detail": f"generated.at `{gen_at}` is not ISO-8601 with offset"})
+        # legacy v0.1 key
+        if "timestamp" in c.fm:
+            findings.append({"level": "info", "concept": c.id, "kind": "legacy-timestamp",
+                             "detail": "v0.1 legacy key, superseded by generated (spec §13.1)"})
+        # actor format: generated.by and verified[].by must be (human|agent|process):slug
+        for actor in _fm_actors(generated, verified):
+            if not _ACTOR_RE.match(actor):
+                findings.append({"level": "info", "concept": c.id, "kind": "actor-format",
+                                 "detail": f"actor `{actor}` does not match (human|agent|process):slug"})
+
     for cid, count in inbound.items():
         if count == 0:
             findings.append({"level": "info", "concept": cid, "kind": "orphan",
@@ -401,6 +515,16 @@ def lint_concepts(concepts):
         if len(owners) > 1:
             findings.append({"level": "warn", "concept": ", ".join(sorted(owners)),
                              "kind": "duplicate", "detail": f"shared title '{title}'"})
+    pair_seen = set()
+    for t in sorted(tag_counts):
+        other = t[:-1] if t.endswith("s") else t + "s"
+        if other in tag_counts:
+            a, b = sorted((t, other))
+            if (a, b) in pair_seen:
+                continue
+            pair_seen.add((a, b))
+            findings.append({"level": "info", "concept": f"{a}/{b}", "kind": "plural-tag",
+                             "detail": f"singular and plural tag forms coexist: '{a}'({tag_counts[a]}) vs '{b}'({tag_counts[b]})"})
     return findings
 
 
@@ -424,6 +548,142 @@ def cmd_lint(args):
     # Never hard-fail unless --strict and there are errors.
     if args.strict and any(f["level"] == "error" for f in findings):
         return 1
+    return 0
+
+
+# --- backlinks -------------------------------------------------------------
+
+def resolve_concept_arg(arg: str, ids):
+    """Resolve a cli concept arg (id, path, or unique slug) to a concept id."""
+    a = arg.strip()
+    for prefix in ("/concepts/", "concepts/", "/"):
+        if a.startswith(prefix):
+            a = a[len(prefix):]
+    if a.endswith(".md"):
+        a = a[:-len(".md")]
+    if a in ids:
+        return a, []
+    slug = a.rsplit("/", 1)[-1]
+    matches = sorted(i for i in ids if i.rsplit("/", 1)[-1] == slug)
+    if len(matches) == 1:
+        return matches[0], [f"resolved slug '{slug}'"]
+    if len(matches) > 1:
+        return None, matches
+    return None, []
+
+
+def cmd_backlinks(args):
+    """List concepts that link to the given concept (reverse link lookup)."""
+    concepts = load_concepts()
+    ids = {c.id for c in concepts}
+    cid, note = resolve_concept_arg(args.concept, ids)
+    if cid is None:
+        if not args.json:
+            if note:
+                print(f"ambiguous: {', '.join(note)}", file=sys.stderr)
+            else:
+                print(f"error: concept not found: {args.concept}", file=sys.stderr)
+        return 1
+    inbound = sorted((c for c in concepts if cid in c.links and c.id != cid), key=lambda c: c.id)
+    if args.json:
+        print(json.dumps([
+            {"id": c.id, "path": c.path.relative_to(REPO_ROOT).as_posix(),
+             "title": c.fm.get("title") or c.id.rsplit("/", 1)[-1]}
+            for c in inbound
+        ], indent=2))
+        return 0
+    for n in note:
+        print(f"(note) {n}")
+    print(f"{len(inbound)} inbound link(s) to /concepts/{cid}.md:")
+    for c in inbound:
+        title = c.fm.get("title") or c.id.rsplit("/", 1)[-1]
+        print(f"  {c.id} — {title}")
+    return 0
+
+
+# --- affected (transitive backlinks) ----------------------------------------
+
+def _transitive_inbound(link_map, roots):
+    """All concept ids that transitively link into any root (roots excluded)."""
+    reverse: dict = {}
+    for cid, links in link_map.items():
+        for t in links:
+            reverse.setdefault(t, []).append(cid)
+    seen = set()
+    stack = list(roots)
+    while stack:
+        cur = stack.pop()
+        for src in reverse.get(cur, ()):
+            if src not in seen:
+                seen.add(src)
+                stack.append(src)
+    seen -= roots
+    return seen
+
+
+def _git_changed_concepts(base):
+    """Ids under concepts/ changed (diff) or untracked vs BASE; None on git failure."""
+    try:
+        changed = subprocess.run(["git", "diff", "--name-only", base, "--", "concepts/"],
+                                 cwd=REPO_ROOT, check=True,
+                                 capture_output=True, text=True).stdout
+        untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "--", "concepts/"],
+                                   cwd=REPO_ROOT, check=True,
+                                   capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    ids = set()
+    for line in (changed + untracked).splitlines():
+        line = line.strip()
+        if not line.endswith(".md") or "concepts/" not in line:
+            continue
+        name = line.rsplit("/", 1)[-1]
+        if name in ("index.md", "log.md", "_template.md"):
+            continue
+        ids.add(line[len("concepts/"):-len(".md")])
+    return ids
+
+
+def cmd_affected(args):
+    """List concepts that transitively link to the given concept (+ optional --git seeds)."""
+    concepts = load_concepts()
+    ids = {c.id for c in concepts}
+    cid, note = resolve_concept_arg(args.concept, ids)
+    if cid is None:
+        if not args.json:
+            if note:
+                print(f"ambiguous: {', '.join(note)}", file=sys.stderr)
+            else:
+                print(f"error: concept not found: {args.concept}", file=sys.stderr)
+        return 1
+    roots = {cid}
+    git_ids = None
+    if args.git:
+        git_ids = _git_changed_concepts(args.git)
+        if git_ids is None:
+            print(f"error: git failed to list changed concepts ({args.git})", file=sys.stderr)
+            return 1
+        roots |= git_ids & ids
+    result = _transitive_inbound({c.id: c.links for c in concepts}, roots)
+    by_id = {c.id: c for c in concepts}
+    hit = sorted((by_id[i] for i in result), key=lambda c: c.id)
+    if args.json:
+        print(json.dumps([
+            {"id": c.id, "path": c.path.relative_to(REPO_ROOT).as_posix(),
+             "title": c.fm.get("title") or c.id.rsplit("/", 1)[-1]}
+            for c in hit
+        ], indent=2))
+        return 0
+    for n in note:
+        print(f"(note) {n}")
+    if git_ids is not None:
+        for seed in sorted(git_ids):
+            n_direct = sum(1 for c in concepts if seed in c.links and c.id != seed)
+            print(f"  {seed}: {n_direct} inbound(s), {len(hit)} transitive total")
+    print(f"{len(hit)} transitive inbound link(s) to /concepts/{cid}.md:")
+    for c in hit:
+        title = c.fm.get("title") or c.id.rsplit("/", 1)[-1]
+        print(f"  {c.id} — {title}")
     return 0
 
 
@@ -823,7 +1083,10 @@ def _append_related_links(path: Path, target_id: str, reason: str):
         body = "\n".join(lines)
     else:
         body = body.rstrip("\n") + "\n\n## Related Concepts\n" + link_line + "\n"
-    fm_end = text.index("---", 3) + 3
+    # Find the true closing frontmatter delimiter — the second line that is exactly "---".
+    # text.index("---", 3) was wrong: it matched any "---" substring inside body/frontmatter.
+    delims = list(re.finditer(r"^---$", text, re.MULTILINE))
+    fm_end = delims[1].end() if len(delims) >= 2 else len(text)
     path.write_text(text[:fm_end] + "\n" + body, encoding="utf-8")
     return True
 
@@ -838,11 +1101,12 @@ def cmd_link(args):
     else:
         try:
             data = json.load(sys.stdin)
-        except json.JSONDecodeError as e:
-            print(f"Error: invalid JSON on stdin: {e}", file=sys.stderr)
+        except json.JSONDecodeError as exc:
+            print(f"Error: invalid JSON on stdin: {exc}", file=sys.stderr)
             return 1
         if not isinstance(data, list):
-            print(f"Error: expected a JSON array on stdin, got {type(data).__name__}", file=sys.stderr)
+            print(f"Error: expected a JSON array on stdin, got {type(data).__name__}",
+                  file=sys.stderr)
             return 1
         _LINK_KEYS = ("score", "a", "b", "reason")
         pairs = []
@@ -850,6 +1114,7 @@ def cmd_link(args):
             missing = [k for k in _LINK_KEYS if k not in d]
             if missing:
                 print(f"Error: entry {i} missing required keys: {', '.join(missing)}", file=sys.stderr)
+                print(f"Each entry must have: {', '.join(_LINK_KEYS)}", file=sys.stderr)
                 return 1
             pairs.append((d["score"], d["a"], d["b"], d["reason"]))
     applied = 0
@@ -1006,7 +1271,8 @@ def _atomic_cache_swap(temp_path: Path, target: Path):
         if old.exists():
             old.unlink(missing_ok=True)
 
-
+# Keywords that must never appear in a user-supplied query, even inside a
+# SELECT — they enable side-effects (file access, schema mutation, etc.).
 _FORBIDDEN_SQL_RE = re.compile(
     r"\b(ATTACH|PRAGMA|CREATE|INSERT|UPDATE|DELETE|DROP|readfile|read_csv)\b",
     re.IGNORECASE,
@@ -1015,7 +1281,12 @@ _MAX_QUERY_BYTES = 1_048_576  # 1 MB
 
 
 def _is_select(sql: str) -> bool:
-    """Check if SQL is a safe read-only SELECT query."""
+    """Check if SQL is a safe read-only SELECT query.
+
+    Must start with SELECT and must not contain any forbidden keywords
+    (ATTACH, PRAGMA, CREATE, INSERT, UPDATE, DELETE, DROP, readfile,
+    read_csv) even inside the body — these enable side-effects.
+    """
     if not sql.lstrip().upper().startswith("SELECT"):
         return False
     if _FORBIDDEN_SQL_RE.search(sql):
@@ -1044,6 +1315,7 @@ def cmd_sql(args):
     if len(sql.encode("utf-8", errors="replace")) > _MAX_QUERY_BYTES:
         print(f"Query too large (limit {_MAX_QUERY_BYTES >> 20} MB).", file=sys.stderr)
         sys.exit(1)
+
 
     # Restrict to read-only queries
     if not _is_select(sql):
@@ -1132,7 +1404,7 @@ def cmd_doctor(args):
 
     agents = REPO_ROOT / "AGENTS.md"
     if agents.exists():
-        at = agents.read_text(encoding="utf-8", errors="replace")
+        at = agents.read_text(encoding="utf-8")
         n = at.count("# OKF Brain — Operating Contract")
         if n != 1:
             err("agents.dup", f"AGENTS.md Operating Contract heading count={n}, want 1")
@@ -1153,7 +1425,7 @@ def cmd_doctor(args):
             if (d / "SKILL.md").exists():
                 skill_names.append(d.name)
     ctx_path = REPO_ROOT / "CONTEXT.md"
-    ctx = ctx_path.read_text(encoding="utf-8", errors="replace") if ctx_path.exists() else ""
+    ctx = ctx_path.read_text(encoding="utf-8") if ctx_path.exists() else ""
     for name in skill_names:
         if name not in ctx and f"skills/{name}" not in ctx:
             warn("route.skill", f"skill {name} not mentioned in CONTEXT.md routing")
@@ -1164,9 +1436,9 @@ def cmd_doctor(args):
         sf = skills_dir / name / "SKILL.full.md"
         if not sm.exists():
             continue
-        sm_t = sm.read_text(encoding="utf-8", errors="replace")
+        sm_t = sm.read_text(encoding="utf-8")
         if sf.exists():
-            sf_t = sf.read_text(encoding="utf-8", errors="replace")
+            sf_t = sf.read_text(encoding="utf-8")
             def fm_field(t, key):
                 if not t.startswith("---"):
                     return None
@@ -1195,7 +1467,7 @@ def cmd_doctor(args):
     if skills_cx.exists():
         for path in skills_cx.rglob("*.md"):
             try:
-                t = path.read_text(encoding="utf-8", errors="replace")
+                t = path.read_text(encoding="utf-8")
             except Exception:
                 continue
             if "okf-ingest.md-channel" in t:
@@ -1218,6 +1490,345 @@ def cmd_doctor(args):
         return 1
     return 0
 
+
+# --- status (single gate: lint + doctor + log chain) ------------------------
+
+def cmd_status(args):
+    """One pass for agents: lint the corpus, run doctor, verify the log chain.
+
+    READY (exit 0) — no errors anywhere. NEEDS ATTENTION (exit 0) — warnings
+    or info only. BLOCKED (exit 1) — any lint error, doctor error, or log-chain
+    failure.
+    """
+    concepts = load_concepts()
+    lint = lint_concepts(concepts)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cmd_doctor(argparse.Namespace(**{**vars(args), "json": True, "strict": False}))
+    doctor = json.loads(buf.getvalue())
+
+    ok_log, msg_log, _unsealed = log_verify(LOG_PATH)
+
+    lint_err = [f for f in lint if f["level"] == "error"]
+    lint_flag = [f for f in lint if f["level"] != "error"]
+    doc_err = [i for i in doctor["issues"] if i["level"] == "error"]
+    doc_flag = [i for i in doctor["issues"] if i["level"] != "error"]
+
+    blocked = bool(lint_err or doc_err) or not ok_log
+    status = "BLOCKED" if blocked else ("NEEDS ATTENTION" if (lint_flag or doc_flag) else "READY")
+
+    result = {"status": status,
+              "lint": {"errors": len(lint_err), "warnings": len(lint_flag), "details": lint},
+              "doctor": {"errors": len(doc_err), "warnings": len(doc_flag), "issues": doctor["issues"]},
+              "log": {"ok": ok_log, "msg": msg_log}}
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(f"okf status: {status}  (lint: {len(lint_err)} error / {len(lint_flag)} warn-info; "
+              f"doctor: {len(doc_err)} error / {len(doc_flag)}; log: {'ok' if ok_log else 'FAIL'})")
+        for f in lint_err[:10]:
+            print(f"  lint error [{f['kind']}] {f['concept']} — {f['detail']}")
+        for i in doc_err[:10]:
+            print(f"  doctor error [{i['code']}] {i['msg']}")
+        if not ok_log:
+            print(f"  log FAIL: {msg_log}")
+    return 1 if blocked else 0
+
+
+# --- log chain (append-only integrity for log.md) ---------------------------
+# JeVMind-style hash chain: h_n = sha256(h_{n-1} | entry_text_n), seeded by the
+# hash of the log's head (everything before the first canonical
+# `## [YYYY-MM-DD]` entry header). The log is append-only at EOF, so every
+# entry anchors its successors: editing, prepending, reordering, or deleting
+# a sealed entry invalidates the chain.
+# State: committed repo-root log.chain.jsonl (JSONL), sealed in the same
+# commit as log.md — an external anchor. Missing state is a hard error,
+# never a silent re-anchor (that would launder a tampered log).
+_LOG_ENTRY_RE = re.compile(r"^## \[(\d{4}-\d{2}-\d{2})\] (.+?)\s*$", re.M)
+
+
+def log_parse_entries(path: Path):
+    """Return (head_text, [(header, entry_text), ...]) from a log.md file.
+    Entry text runs from its header line to the next canonical header, with
+    trailing newlines stripped so appending a new entry at EOF never alters
+    the previous entry's bytes; non-canonical headers inside the range
+    belong to the previous entry."""
+    text = path.read_text(encoding="utf-8")
+    matches = list(_LOG_ENTRY_RE.finditer(text))
+    if not matches:
+        return text, []
+    head = text[: matches[0].start()]
+    entries = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        entries.append((f"{m.group(1)} | {m.group(2)}", text[m.start():end].rstrip("\n")))
+    return head, entries
+
+
+def log_text_hash(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def log_compute_chain(head: str, entries):
+    prev = log_text_hash(head)
+    chain = []
+    for header, text in entries:
+        prev = log_text_hash(prev + text)
+        chain.append({"header": header, "hash": prev})
+    return prev, chain  # (tail hash, per-entry records)
+
+
+def log_write_state(path: Path, head: str, chain):
+    """Write JSONL state: line 1 {"head"}, then {"n","header","hash"} per entry."""
+    lines = [json.dumps({"head": log_text_hash(head)})]
+    for n, rec in enumerate(chain, 1):
+        lines.append(json.dumps({"n": n, "header": rec["header"], "hash": rec["hash"]}))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def log_load_state(path: Path):
+    """Return (head_hash, [{"n","header","hash"}, ...]) from JSONL state."""
+    head, entries = None, []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        if "head" in rec:
+            head = rec["head"]
+        else:
+            entries.append(rec)
+    return head, entries
+
+
+def log_verify(path: Path, state_path: Path = LOG_STATE):
+    """Verify the log.md chain against committed state.
+    Returns (ok, msg, unsealed): ok = head + sealed prefix intact; unsealed =
+    canonical entries appended since the last seal (0..N, informational; 0
+    on failure paths). Never bootstraps: missing state is a hard error."""
+    head, entries = log_parse_entries(path)
+    if not entries:
+        return False, f"no canonical `## [YYYY-MM-DD]` entries in {path}", 0
+    tail, recomputed = log_compute_chain(head, entries)
+    if not state_path.exists():
+        return False, f"no chain state at {state_path} — run `okf log --bootstrap` (or restore from git)", 0
+    state_head, stored = log_load_state(state_path)
+    if state_head != log_text_hash(head):
+        return False, "log.md head (text before first entry) changed since chain seed", 0
+    for n, (s, r) in enumerate(zip(stored, recomputed), 1):
+        if s.get("header") != r["header"]:
+            return False, f"entry {n} header differs: {r['header']!r} != stored {s.get('header')!r}", 0
+        if s.get("hash") != r["hash"]:
+            return False, f"entry {n} ({r['header']}) hash mismatch — edited, moved, or replaced since seal", 0
+    unsealed = len(recomputed) - len(stored)
+    if unsealed < 0:
+        word = "entry" if unsealed == -1 else "entries"
+        return False, f"{-unsealed} sealed {word} missing (deleted or truncated?)", 0
+    msg = f"OK: {len(stored)} entries sealed"
+    if unsealed:
+        msg += f", {unsealed} unsealed — run `okf log --seal`"
+    return True, msg + f", tail {tail[:12]}…", unsealed
+
+
+def log_seal(path: Path, state_path: Path = LOG_STATE):
+    """Verify the sealed prefix, then fold unsealed appends into state. (ok, msg)"""
+    ok, msg, unsealed = log_verify(path, state_path)
+    if not ok:
+        return False, msg
+    if not unsealed:
+        return True, msg
+    head, entries = log_parse_entries(path)
+    _, recomputed = log_compute_chain(head, entries)
+    log_write_state(state_path, head, recomputed)
+    word = "entry" if unsealed == 1 else "entries"
+    return True, f"sealed {unsealed} new {word} → {len(recomputed)} total"
+
+
+def log_bootstrap(path: Path, state_path: Path = LOG_STATE):
+    """Explicit first-run seal: chain the log's current content into state. (ok, msg)"""
+    head, entries = log_parse_entries(path)
+    if not entries:
+        return False, f"no canonical `## [YYYY-MM-DD]` entries in {path}"
+    tail, chain = log_compute_chain(head, entries)
+    log_write_state(state_path, head, chain)
+    return True, f"bootstrap: sealed {len(chain)} entries, tail {tail[:12]}… → {state_path}"
+
+
+def cmd_log(args):
+    if args.bootstrap:
+        ok, msg = log_bootstrap(LOG_PATH)
+    elif args.seal:
+        ok, msg = log_seal(LOG_PATH)
+    else:
+        ok, msg, _ = log_verify(LOG_PATH)
+    print(msg)
+    return 0 if ok else 1
+
+
+# --- schema (CLI manifest as JSON) ------------------------------------------
+
+def cmd_schema(args):
+    """Emit the CLI's own command manifest as JSON, derived from the live
+    argparse parser (single source of truth — no hand-maintained list)."""
+    p = build_parser()
+    cmds = {}
+    for action in p._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        # 3.12 keeps the subparser `help` strings on _ChoicesParsersAction's
+        # pseudo-actions, positionally aligned with the choices dict.
+        for (name, sp), pseudo in zip(action.choices.items(), action._choices_actions):
+            cmds[name] = {"help": sp.description or pseudo.help,
+                          "args": [a.dest for a in sp._actions if not a.option_strings]}
+    print(json.dumps({"name": p.prog, "description": p.description, "commands": cmds},
+                     indent=args.indent))
+    return 0
+
+
+# --- export (shareable-only bundle) ------------------------------------------
+
+def _render_llms(concepts):
+    lines = ["# OKF Shareable Bundle", ""]
+    for c in concepts:
+        title = c.fm.get("title") or c.id.rsplit("/", 1)[-1]
+        desc = (c.fm.get("description") or "").strip().replace("\n", " ")
+        lines.append(f"## [{title}](/concepts/{c.id}.md)")
+        if desc:
+            lines.append(f"{desc}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _export_attachments(shareable, out: Path) -> int:
+    """Copy raw/attachments files referenced from exported (shareable) bodies.
+
+    Preserves the raw/attachments/ layout so relative (../../../raw/…) and
+    root-relative (/raw/…) link forms both resolve in the bundle. Only files
+    actually referenced by shareable concepts are copied — private concepts'
+    attachments stay in the vault.
+    """
+    need = set()
+    for c in shareable:
+        need.update(_ATTACH_REF_RE.findall(c.body))
+    att_root = REPO_ROOT / "raw" / "attachments"
+    att_dir = out / "raw" / "attachments"
+    count = 0
+    for name in sorted(need):
+        if not name:
+            continue
+        cand = (att_root / unquote(name)).resolve()
+        if not cand.is_relative_to(att_root.resolve()):
+            continue  # name escapes the attachments dir (e.g. ..%2F)
+        if not cand.is_file():
+            continue  # dead ref in corpus — tolerated, link stays broken in bundle
+        dest = att_dir / cand.name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cand, dest)
+        count += 1
+    return count
+
+
+
+def _render_sitemap(concepts):
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
+    for c in sorted(concepts, key=lambda c: c.id):
+        title = _xml_escape(c.fm.get("title") or c.id.rsplit("/", 1)[-1])
+        lines.append(f"  <url><loc>/concepts/{c.id}.md</loc><title>{title}</title></url>")
+    lines.append("</urlset>")
+    return "\n".join(lines) + "\n"
+
+
+def _write_manifest(out: Path):
+    """Write MANIFEST.json: sha256 of every bundle file (written last, so it
+    covers index.json/llms.txt/sitemap.xml but not itself)."""
+    files = sorted(p for p in out.rglob("*")
+                   if p.is_file() and p.name != "MANIFEST.json")
+    manifest = [{"path": p.relative_to(out).as_posix(), "sha256": sha256(p.read_bytes()).hexdigest()}
+                for p in files]
+    (out / "MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def _verify_bundle(out: Path, shareable):
+    """Re-read the bundle and check: every concept is shareable (hard error), every
+    attachment ref either resolves back inside the vault attachments dir (refs that
+    escape, e.g. ..%2F, are hard errors — the copier refuses them by design), and
+    no attachment that exists in the vault was lost by the export (hard error);
+    dangling internal links and attachment refs dead in the vault are counted,
+    never fatal (contract: broken links are tolerated; cross-visibility links to
+    private concepts are normal in a healthy vault).
+    Returns (files_checked, links_checked, [error strings], n_dangling, n_dead)."""
+    bundle_ids = {c.id for c in shareable}
+    files = 0
+    links = 0
+    errors = []
+    dangling = 0
+    dead = 0
+    att_dir = (out / "raw" / "attachments").resolve()
+    for c in sorted(shareable, key=lambda c: c.id):
+        f = out / c.path.relative_to(REPO_ROOT)
+        try:
+            fm, _ = split_frontmatter(f.read_text(encoding="utf-8"))
+        except OSError as e:
+            errors.append(f"cannot re-read {c.path.relative_to(REPO_ROOT)}: {e}")
+            continue
+        files += 1
+        if fm.get("visibility") != "shareable":
+            errors.append(f"{c.id}: bundle copy visibility is {fm.get('visibility')!r}, expected shareable")
+        for ref in _ATTACH_REF_RE.findall(c.body):
+            links += 1
+            name = unquote(ref)
+            vault_root = (REPO_ROOT / "raw" / "attachments").resolve()
+            vault_cand = (vault_root / name).resolve()
+            cand = (att_dir / name).resolve()
+            if not cand.is_relative_to(att_dir) or not vault_cand.is_relative_to(vault_root):
+                errors.append(f"{c.id}: attachment ref raw/attachments/{name!r} escapes the attachments dir")
+            elif not cand.is_file():
+                if vault_cand.is_file():
+                    errors.append(f"{c.id}: attachment ref raw/attachments/{name!r} is in the vault but not in the bundle")
+                else:
+                    dead += 1  # dead ref in corpus — tolerated, link stays broken in bundle
+        for target in extract_links(c.body, c.id):
+            links += 1
+            if target not in bundle_ids:
+                dangling += 1
+    return files, links, errors, dangling, dead
+
+
+def cmd_export(args):
+    """Export shareable concepts to a bundle dir. Hard visibility filter:
+    private concepts NEVER leave the vault. Copies the raw/attachments files
+    referenced from shareable bodies; private attachments stay put."""
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    concepts = load_concepts()
+    ignore = args.ignore or []
+    kept = [c for c in concepts
+            if not any(fnmatch(c.path.relative_to(REPO_ROOT).as_posix(), g) for g in ignore)]
+    n_ignored = len(concepts) - len(kept)
+    shareable = [c for c in kept if c.fm.get("visibility") == "shareable"]
+    skipped = len(kept) - len(shareable)
+    for c in shareable:
+        dest = out / c.path.relative_to(REPO_ROOT)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(c.path, dest)
+    n_attach = _export_attachments(shareable, out)
+    (out / "index.json").write_text(
+        json.dumps(build_index(shareable), indent=2, ensure_ascii=False),
+        encoding="utf-8")
+    (out / "llms.txt").write_text(_render_llms(shareable), encoding="utf-8")
+    (out / "sitemap.xml").write_text(_render_sitemap(shareable), encoding="utf-8")
+    _write_manifest(out)
+    n_files, n_links, verrors, n_dangling, n_dead = _verify_bundle(out, shareable)
+    for e in verrors[:10]:
+        print(f"verify: {e}", file=sys.stderr)
+    tail = f", {n_ignored} ignored" if n_ignored else ""
+    print(f"export: {len(shareable)} shareable concept(s) → {out} "
+          f"({skipped} private excluded){tail}, {n_attach} attachment(s) copied")
+    print(f"verified: {n_files} files, {n_links} links checked, "
+          f"{len(verrors)} lost, {n_dangling} dangling, {n_dead} dead-refs")
+    return 1 if verrors else 0
 
 
 # --- icm-sync (refresh CONTEXT skill routing) -------------------------------
@@ -1242,7 +1853,7 @@ def cmd_icm_sync(args):
     if not ctx_path.exists():
         print("error: CONTEXT.md missing", file=sys.stderr)
         return 1
-    ctx = ctx_path.read_text(encoding="utf-8", errors="replace")
+    ctx = ctx_path.read_text(encoding="utf-8")
     missing = [s for s in skills if s not in ctx and f"skills/{s}" not in ctx]
     present = [s for s in skills if s in ctx or f"skills/{s}" in ctx]
     print(f"icm-sync: {len(skills)} skill(s); {len(present)} routed; {len(missing)} missing")
@@ -1268,16 +1879,7 @@ def cmd_icm_sync(args):
     else:
         ctx = ctx.rstrip() + "\n\n## Auto-routed skills\n" + block + "\n"
     if not args.dry_run:
-        # Atomic write: temp file + os.replace to avoid partial writes
-        fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=str(ctx_path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(ctx)
-            os.replace(tmp, str(ctx_path))
-        except Exception:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-            raise
+        ctx_path.write_text(ctx, encoding="utf-8")
         print(f"wrote {len(missing)} routing stub(s) into CONTEXT.md")
     return 0
 
@@ -1315,6 +1917,16 @@ def build_parser():
     sp.add_argument("--dry-run", action="store_true", help="Preview rewrites; write nothing.")
     sp.set_defaults(func=cmd_relink)
 
+    sp = sub.add_parser("backlinks", help="List inbound links to one concept (id, path, or unique slug).")
+    sp.add_argument("concept", help="Concept id under concepts/, path, or unique slug.")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_backlinks)
+
+    sp = sub.add_parser("affected", help="Transitive inbound links (what would need review if X changes); --git BASE seeds from diff.")
+    sp.add_argument("concept", help="Concept id under concepts/, path, or unique slug.")
+    sp.add_argument("--git", metavar="BASE", help="Also seed roots from git diff + untracked concepts vs BASE.")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_affected)
     sp = sub.add_parser("doctor", help="Agent-surface integrity (ICM, AGENTS, AAAK, routing).")
     sp.add_argument("--json", action="store_true")
     sp.add_argument("--strict", action="store_true", help="Exit non-zero on errors.")
@@ -1346,6 +1958,25 @@ def build_parser():
     sp = sub.add_parser("sql", help="Run ad-hoc SQL queries over the corpus (requires duckdb).")
     sp.add_argument("query", nargs="*", help="SQL query (read from stdin if omitted).")
     sp.set_defaults(func=cmd_sql)
+
+    sp = sub.add_parser("log", help="Verify the hash chain over log.md (state: root log.chain.jsonl).")
+    sp.add_argument("--seal", action="store_true", help="Fold unsealed appends into the chain.")
+    sp.add_argument("--bootstrap", action="store_true", help="Explicit first-run seal (never automatic).")
+    sp.set_defaults(func=cmd_log)
+
+    sp = sub.add_parser("status", help="Single gate: lint + doctor + log chain → READY / NEEDS ATTENTION / BLOCKED.")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("schema", help="Emit this CLI's command manifest as JSON.")
+    sp.add_argument("--indent", type=int, default=2, help="JSON indent width (default 2).")
+    sp.set_defaults(func=cmd_schema)
+
+    sp = sub.add_parser("export", help="Export shareable concepts to a bundle dir (private never exported).")
+    sp.add_argument("--out", required=True, help="Destination directory for the bundle.")
+    sp.add_argument("--ignore", action="append", default=[], metavar="GLOB",
+                    help="Ignore repo-relative concept path GLOB(s), repeated (excluded from bundle).")
+    sp.set_defaults(func=cmd_export)
     return p
 
 

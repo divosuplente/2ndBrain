@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-query
-description: "Query and search the OKF brain vault. Triggered when user asks \"what do I know about X\", \"search for\", \"find concepts about\", \"what's in the brain about\", or asks a factual question about stored knowledge. Uses okf search, reads index.md, navigates concept files, and answers with citations to exact concept files. NOT for spaced repetition or scheduling recall practice — use okf-review for that."
+description: "Query and search the OKF brain vault. Triggered on 'what do I know about X', 'search for', 'find concepts'."
 ---
 
 # OKF Query — Search & Recall from the Brain

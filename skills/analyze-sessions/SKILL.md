@@ -1,7 +1,7 @@
 ---
 type: skill
 name: analyze-sessions
-description: "Analyze past OMP agent sessions: search transcripts, render sessions as markdown, mine prompting patterns, and roll up costs. Use when the user wants to find a past session, review what was done, surface recurring patterns, or understand token/cost spend."
+description: "Analyze past OMP agent sessions: search transcripts, render sessions as markdown, mine prompting patterns, and roll up costs."
 ---
 
 # Analyze Sessions

@@ -1,10 +1,6 @@
 ---
 name: okf-teach
-description: |
-  Teach a new skill or language over multiple sessions using the OKF teaching workspace.
-  Activates when the user wants to learn something new, asks for help studying a topic,
-  requests a lesson plan, or says they are trying to understand a subject. Covers managing,
-  continuing, or creating lessons in the teaching/ workspace.
+description: "Teach skill/language over multiple sessions via OKF teaching workspace. Lesson plans, progress, exercises."
 ---
 
 ## When to use
@@ -86,11 +82,17 @@ Write a learning record to `_records/<topic>/` capturing the retrospective's key
 2. **Draft Lesson:** Create `<topic>/lessons/<NN>-name.md` (e.g., `dutch/lessons/0001-greetings.md`).
    - Frontmatter: `title`, `description`, `level` (e.g., "A0"), `duration` (e.g., "5 min"), `weight` (ordering number).
    - Focus on ONE tightly-scoped concept tied to the mission.
-   - Include visual rules, real examples, memory tricks, and a micro-challenge.
+   - Include visual rules, real examples, and memory tricks. Exercises are step 3.
    - Use Markdown/MDX; Starlight handles layout, sidebar, prev/next, and dark mode automatically.
-3. **Visualize:** If the lesson covers structural, spatial, or relational ideas, invoke the `visualize` skill to add a diagram. Save to the topic's `reference/` folder and embed in the lesson.
-4. **Unslop:** Check if the `unslop` skill is available. If yes, run it on the lesson prose to strip AI patterns. If not, skip this step — do not hallucinate the skill's behavior.
-5. **Review:** Use the `multi-reviewer-patterns` skill to coordinate parallel reviews across dimensions:
+   - **Math**: write formulas as LaTeX (`$...$` inline, `$$...$$` display) — rendered as native MathML site-wide via `@webc.site/math-remark` (no client JS/CSS). Stick to its supported subset: no `\xrightarrow`, `\lfloor`/`\rfloor`, or KaTeX-only macros. Never plain-text math like `a · b = |a| × |b| × cos(θ)` in prose.
+   - **Diagrams**: use ` ```mermaid ` fences for flow/structure diagrams (site renders them client-side) — never ASCII-art boxes in bare fences. Word-order/sentence-slot patterns in language courses are usually better as markdown tables. Spatial sketches (3D axes, geometry) may stay as-is or become images.
+3. **Exercises:** Every lesson gets exercises by default — invoke the `teach-interactive` skill to design and generate them. Two forms:
+   - **Standalone exercise page** (simulation, sandbox, quiz): a `.astro` page at `teaching/site/src/pages/<course>/lessons/<NNNN>-<slug>.astro`. The sidebar links it automatically under its parent lesson via `sidebar-gen.mjs` — no manual config. Link it from the lesson body with its absolute route (trailing slash).
+   - **Inline exercises** (Micro-challenge pattern in the lesson body): markdown exercises with collapsible answers, no separate route. These MUST still follow `teach-interactive`'s design rules (`concepts/learning/methods/lesson-design-rules.md`): minimum 3 exercises, difficulty ladder (direct → variation → extension), target the hard parts, force recall, always provide answers.
+   Choose the form by concept: manipulable, spatial, or simulation-friendly concepts → standalone page; quick recall/translation drills → inline. A lesson may use both.
+4. **Visualize:** If the lesson covers structural, spatial, or relational ideas, invoke the `visualize` skill to add a diagram. Save to the topic's `reference/` folder and embed in the lesson.
+5. **Unslop:** Check if the `unslop` skill is available. If yes, run it on the lesson prose to strip AI patterns. If not, skip this step — do not hallucinate the skill's behavior.
+6. **Review:** Use the `multi-reviewer-patterns` skill to coordinate parallel reviews across dimensions:
    - **Accuracy**: grammar, facts, false friends, links correct?
    - **Alignment**: matches `LEARNING-PREFERENCES.md`, `_MISSION.md`, `_NOTES.md`?
    - **Grounding**: real-world anchors (radio, daily life, city)?
@@ -111,4 +113,4 @@ Write a learning record to `_records/<topic>/` capturing the retrospective's key
 - ALWAYS run unslop + multi-reviewer-patterns pipeline after drafting lessons or reference docs.
 - Lessons are MDX (`.md`), reference docs are MDX, learning records are Markdown.
 - Starlight handles navigation, prev/next, dark mode, and responsive layout — do not bake these into lessons.
-- Use Astro components (`<details>`, `<summary>`, custom components) for interactive quiz/reveal elements.
+- Exercises are the default in every lesson, designed via the `teach-interactive` skill — either a standalone `.astro` exercise page or inline Micro-challenge exercises in the lesson body. Inline exercises follow the same design rules (hard parts, recall, answers, difficulty ladder) as standalone pages.

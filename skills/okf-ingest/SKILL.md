@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-ingest
-description: "Ingest a single URL, YouTube video, or web article into the OKF brain. For YouTube: fetches transcript via yt-dlp, preprocesses VTT into clean prose, extracts knowledge into a concept + deep reference file with grounded external sources (Wikipedia, primary citations), creates creator concept, extracts linked tools/resources. For web: fetches and extracts readable content. NOT for folders of files — use okf-batch-ingest. NOT for YouTube channels — use okf-ingest-channel. NOT for textbooks — use okf-book-ingest."
+description: "Ingest a single URL, YouTube video, or web article into the OKF brain."
 ---
 
 # OKF Ingest — Universal Content Ingest Workflow

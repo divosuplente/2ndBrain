@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-study
-description: "Govern a self-study session for non-domain-specific topics using the OKF vault. Combines retrieval practice, Feynman technique, problem-solving, and cross-linking into a single study loop. Triggered when the user says \"study\", \"let me learn\", \"study session\", or \"work through\" for a general topic."
+description: "Govern a self-study session for non-domain-specific topics using the OKF vault."
 ---
 
 # OKF Study Skill

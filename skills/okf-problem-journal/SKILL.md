@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-problem-journal
-description: Create, review, and query worked problem entries in the OKF vault. Problems are first-class concepts under concepts/learning/<domain>/problems/. Triggered by "record problem", "log problem", "problem journal", "review my mistakes", "problem stats", or during okf-study sessions.
+description: "Create, review, and query worked problem entries in the OKF vault. Problems are first-class concepts under concepts/learning/<domain>/problems/."
 ---
 
 # OKF Problem Journal Skill

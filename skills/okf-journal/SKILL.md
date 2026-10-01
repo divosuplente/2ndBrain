@@ -1,12 +1,7 @@
 ---
 type: skill
 name: okf-journal
-description: >-
-  Journal entry and therapy/session note ingestion into the OKF brain. Triggered
-  when user mentions journaling, therapy notes, therapy session, journal entry,
-  personal reflection, or sensitive personal content to save. ALWAYS visibility:
-  private. Domain life (usually life/personal or life/neurodivergent via FBC).
-  Never shareable export.
+description: "Ingest journal/therapy notes into OKF brain. Always visibility private, never shareable export."
 ---
 
 # OKF Journal — Private personal & therapy ingest

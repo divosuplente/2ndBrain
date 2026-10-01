@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-batch-ingest
-description: "Ingest a folder of markdown files (and attachments) into the OKF brain. Triggered when user provides a directory path with multiple .md files, or says \"ingest this folder\" or \"process these files\". Processes files in batches of 10. NOT for single URLs — use okf-ingest. NOT for YouTube channels — use okf-ingest-channel. NOT for textbooks — use okf-book-ingest."
+description: "Ingest a folder of markdown files (and attachments) into the OKF brain."
 ---
 
 # OKF Folder Ingest — Batch Markdown + Attachments
@@ -26,8 +26,7 @@ description: "Ingest a folder of markdown files (and attachments) into the OKF b
 - User references a folder with `.md` files and/or images/PDFs
 
 ## Execution Pattern
-
-Use `completion()` from the eval kernel with `parallel()` for batch processing — subagents on smaller models fail at complex OKF extraction/writing tasks. Process in batches of 10.
+Use the eval kernel for batch processing — subagents on smaller models fail at complex OKF extraction/writing tasks. Process in batches of 10. **Split by job: routing/classification decisions go to the `judge` decision model (`judge_batch`, Step 2); content writing (body, title, description, tags) goes to `completion()`.**
 
 ```
 # Correct pattern
@@ -48,57 +47,108 @@ Read the directory tree
 - Skip hub files (domain/subdomain hubs are structural, not source content)
 ```
 
-### Step 2: Classify Each File (Full-Body Classification)
+### Step 2: Classify Each File with the judge model (Full-Body Classification)
 
-For each markdown file:
+Routing decisions — `type`, `domain`, `subdomain`, `subsubdomain`, `visibility`, and `action` (create/update/skip) — are typed judgments and MUST be made by the eval kernel's `judge_batch` (TypeSafe decision model) over each file's **full body**. The judge returns only closed-set choices — it cannot emit a free-form path like `tools/agents/mcp` — so every option set is a closed label list: the 10 domains, the unified type vocabulary, and the known leaves from `_config/taxonomy.md` (`@tax`), plus an explicit `new-leaf` escape label that routes to the taxonomy extension protocol when nothing fits durably. Never route on filename, title keywords, or keyword tables: the judge sees the body, and the rubric below is encoded as its criteria.
 
-1. **Check existing frontmatter** — parse it if present
-2. **Read the FULL body** of the file — do NOT rely on filename, keyword matching, or tag tables alone
-3. **Based on the FULL content**, determine domain/subdomain/subsubdomain:
+**One `judge_batch` per run** — every file is one state, all states answer the same questions:
 
-   | Domain | Content scope | Visibility default |
-   |--------|--------------|-------------------|
-   | `life` | **ONLY** personal: neurodivergent, therapy, journaling, personal goals, travel, mindfulness | private |
-   | `learning` | Everything else: recipes, cooking, health, exercise, dev articles, languages, music, aromatherapy, keto | shareable |
-   | `tools` | GitHub repos, apps, devices, software | shareable |
-   | `skills` | AI-related content | shareable |
-   | `specs` | AI-related specifications | shareable |
-   | `people` | Private contacts | private |
-   | `orgs` | Organizations | private |
-   | `documents` | Identity/records | private |
-   | `work` | Work logs, enterprise notes | private |
-   | `creators` | Public content creators | shareable |
+- **State is contentful**: the file's full body including frontmatter (long files: head (first ~40 lines) + all H1/H2 headings). Never feed only title/filename — that bakes in the filename-derived classification failure this step exists to kill.
+- Append to each state: `CANDIDATES: <top okf search hits for the title, path + one-line description each>` so `action` can be judged from one call.
 
-   **Personal domains** (`life`, `people`, `orgs`, `documents`, `work`) default to `visibility: private`. All other domains default to `shareable`. When unsure, treat as `private`.
+```python
+questions = {
+  "type": {"type": "choice",
+           "instructions": "Which unified type best fits this concept? Judge from the full body, not the filename.",
+           "criteria": {"tool": "software/product/CLI/app/device being described",
+                        "skill": "agent/harness skill or reusable procedure",
+                        "spec": "standard/protocol/interface specification",
+                        "person": "an individual",
+                        "organization": "a company or group",
+                        "document": "identity/legal/personal record",
+                        "topic": "general topic, no concrete artifact",
+                        "learning": "course, study plan, learning resource",
+                        "reference": "lookup material: glossary, table, list",
+                        "playbook": "step-by-step runbook/playbook",
+                        "project": "ongoing project/effort",
+                        "goal": "set target or outcome",
+                        "habit": "routine or repeated practice",
+                        "key-element": "recurring element/attribute in a system",
+                        "source": "a source itself (video, article, recording)",
+                        "note": "fallback when nothing else fits"}},
+  "domain": {"type": "choice",
+             "instructions": "Which ONE domain does this source describe? Judge from the full body, not the filename.",
+             "criteria": {  # rubric = the domain table below
+                 "life": "ONLY personal: neurodivergent, therapy, journaling, personal goals, travel, mindfulness",
+                 "learning": "non-personal content: recipes, health, exercise, dev articles, languages, music, keto, etc.",
+                 "tools": "GitHub repos, apps, devices, software tools",
+                 "skills": "AI-related skill/agent-skill content",
+                 "specs": "AI-related specifications",
+                 "people": "private contacts", "orgs": "organizations",
+                 "documents": "identity/records", "work": "work logs, enterprise notes",
+                 "creators": "public content creators"}},
+  "subdomain": {"type": "choice",
+                "instructions": "Which subdomain under the chosen domain? Labels are the domain's known leaves from `_config/taxonomy.md`. Choose 'flat' if the concept belongs directly in the domain; 'new-leaf' only if no existing leaf fits durably.",
+                "criteria": {"flat": None,
+                # runtime: read the "Known subdomains" row for this domain from `_config/taxonomy.md` →
+                # one label per leaf; +"new-leaf": "no existing leaf fits — extend the taxonomy (sanity gate below)"
+                }},
+  "subsubdomain": {"type": "choice",
+                   "instructions": "Which subsubdomain under (domain, subdomain)? Same rules: known leaves from `_config/taxonomy.md` only, 'flat' when none apply, 'new-leaf' when nothing fits durably.",
+                   "criteria": {"flat": None,
+                   # runtime: read the "Known subsubdomains" row for this path from `_config/taxonomy.md` →
+                   # one label per leaf; +"new-leaf": "no existing leaf fits — extend the taxonomy (sanity gate below)"
+                   }},
+  "visibility": {"type": "choice",
+                 "instructions": "private for personal/sensitive content, shareable otherwise; when unsure, private.",
+                 "criteria": {"private": "personal/sensitive — never exported",
+                              "shareable": "eligible for shareable export"}},
+  "action": {"type": "choice",
+             "instructions": "Decide using the CANDIDATES list. 'skip-duplicate' ONLY when a candidate is the same source already ingested.",
+             "criteria": {"create": "no existing concept covers this",
+                          "update-existing": "same project/tool/person as a candidate — extend it, append source",
+                          "skip-duplicate": "a prior ingest of this exact source already created the concept"}},
+}
+b = judge_batch(states, questions, intent="okf-batch-classify")
+# pull across cells: await b.drain(timeout) until b.status()["running"] == 0; inspect b.failed()
+```
 
-4. **Subdomain routing** — match against `VALID_SUBDOMAINS`, not keyword tables:
+**Sanity gate before writing (judge output is a recommendation, not law):**
+- Labels must come from the closed sets (unified type vocabulary + `_config/taxonomy.md` leaves). Unknown label → re-judge that one state with the valid labels enumerated.
+- `new-leaf` (subdomain or subsubdomain) → run the taxonomy extension protocol in `_config/taxonomy.md` BEFORE writing: kebab-case leaf name, create hub file, update `@tax`, `log.md` entry when durable. Never force-fit a wrong leaf.
+- `action: skip-duplicate` needs the matched candidate in the state's CANDIDATES; low confidence → treat as `create` and let Step 6 canonicalize resolve the collision.
+- Every state must answer; a failed state → classify it manually before writing, never leave a file unrouted.
 
-   ```
-   VALID_SUBDOMAINS = {
-       "creators": ["general"], "documents": ["general"], "specs": ["general"], "orgs": ["general"],
-       "people": ["medical", "tech", "general"], "skills": ["claude-code", "content", "general"],
-       "work": ["sharepoint", "azure", "general"],
-       "life": ["neurodivergent", "personal", "travel", "mindfulness"],
-       "tools": ["agents", "dev", "general"],
-       "learning": ["dev", "languages", "music", "skills", "keto", "cooking", "health", "sharepoint", "aromatherapy", "general"],
-   VALID_SUBSUBS = {
-       "learning": {"dev": ["javascript", "react", "css", "typescript", "vue", "svelte", "html", "git", "dotnet", "api", "performance", "ai", "architecture"],
-                    "health": ["fitness", "nutrition"],
-                    "skills": ["journaling"],
-       "tools": {"agents": ["orchestration", "coding-agents", "sandboxes", "memory", "mcp", "general"],
-                 "dev": ["general", "devices"],
-                 "general": ["devices", "general", "orchestration"]},
-   }
-   ```
+For each file, after the batch resolves:
+1. **Check existing frontmatter** — parse it if present (feeds the state and the title/slug derivation)
+2. **Derive slug** from the frontmatter `title` or a real title in the body (never from a mangled clipping filename): format `{owner}-{name}` lowercase with hyphens
+3. **Check for existing concept** with that slug → the judge's `action` already covered candidates; a slug hit still means merge, never overwrite
 
-5. **Critical domain routing changes** (vs. legacy):
-   - `cooking`, `health`, `keto`, `aromatherapy` → `learning/`, NOT `life/`
-   - `life/` is **ONLY** neurodivergent, personal, travel, mindfulness
-   - `tools/health` → distributed: devices stay in `tools/dev/devices/`, apps/content go to `learning/health/`
-   - `tools/dev/coding-agents` → `tools/agents/coding-agents`
-   - `tools/dev/orchestration` → `tools/agents/orchestration`
-6. **Derive slug** from title or filename: format `{owner}-{name}` lowercase with hyphens
-7. **Check for existing concept** with that slug → skip or merge
+**Rubric for the criteria (encode in the question text verbatim):**
+
+| Domain | Content scope | Visibility default |
+|--------|--------------|-------------------|
+| `life` | **ONLY** personal: neurodivergent, therapy, journaling, personal goals, travel, mindfulness | private |
+| `learning` | Everything else: recipes, cooking, health, exercise, dev articles, languages, music, aromatherapy, keto | shareable |
+| `tools` | GitHub repos, apps, devices, software | shareable |
+| `skills` | AI-related content | shareable |
+| `specs` | AI-related specifications | shareable |
+| `people` | Private contacts | private |
+| `orgs` | Organizations | private |
+| `documents` | Identity/records | private |
+| `work` | Work logs, enterprise notes | private |
+| `creators` | Public content creators | shareable |
+
+**Personal domains** (`life`, `people`, `orgs`, `documents`, `work`) default to `visibility: private`. All other domains default to `shareable`. When unsure, treat as `private`.
+
+**Subdomain routing labels** are the closed sets from `_config/taxonomy.md` (`@tax`) — the current map, loaded fresh each run; do not re-paste or hardcode tables here (the file is extensible and authoritative). Never route on keyword tables.
+
+**Critical domain routing changes** (vs. legacy) — apply to the rubric text and to any manual override:
+- `cooking`, `health`, `keto`, `aromatherapy` → `learning/`, NOT `life/`
+- `life/` is **ONLY** neurodivergent, personal, travel, mindfulness
+- `tools/health` → distributed: devices stay in `tools/dev/devices/`, apps/content go to `learning/health/`
+- `tools/dev/coding-agents` → `tools/agents/coding-agents`
+- `tools/dev/orchestration` → `tools/agents/orchestration`
 
 ### Step 2b: Tag Audit (During Ingest)
 
@@ -279,7 +329,7 @@ Fix any new lint regressions introduced by this batch (broken links to newly cre
 |--------|------------------|-------------------|
 | Scope | Folders of mixed markdown | Entire YouTube channel |
 | Source types | GitHub READMEs, article clippings, notes, videos | YouTube transcripts only |
-| Classification | Full-body classification (read entire body, not keywords) | Tag-based transcript routing |
+| Classification | `judge` decision model (`judge_batch`) routing per rubric; full-body read, not keywords | Tag-based transcript routing |
 | Canonicalization | Slug collision + tag/title normalization with reorg merge rules | Cross-video concept merging + taxonomy |
 | ASR normalization | Only for video-provenance items | Always (all sources are transcripts) |
 | Best for | Inbox processing, clippings, mixed folders | Building a knowledge domain from a creator's catalog |

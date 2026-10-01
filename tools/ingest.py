@@ -150,7 +150,110 @@ def escape_body_hashtags(body: str) -> str:
     # 7. Restore placeholders
     for key, value in _map.items():
         w = w.replace(key, value)
-    return w
+
+# ---------------------------------------------------------------------------
+# Security screening (prompt injection / steganography / homoglyphs)
+# ---------------------------------------------------------------------------
+# Injection phrase bank vendored from
+# https://raw.githubusercontent.com/darshanNhb/okf-guard/main/src/okfguard/rules/injection_patterns.py
+# Apache-2.0 (darshanNhb/okf-guard), vendored for stdlib-only ingest.
+# 31 patterns across 8 categories: instruction_override, new_instruction,
+# fake_role_assertion, fake_system_marker, direct_ai_address,
+# data_exfiltration, permission_override, jailbreak.
+_INJECTION_PATTERNS: tuple[tuple[str, "re.Pattern[str]", float], ...] = (
+    ("instruction_override", re.compile(r"ignore (all |the )?(previous|prior|above|earlier|preceding) (instructions?|prompts?|directives?|rules?|guidelines?)", re.IGNORECASE), 0.85),
+    ("instruction_override", re.compile(r"disregard (all |the )?(above|previous|prior|earlier|preceding)", re.IGNORECASE), 0.80),
+    ("instruction_override", re.compile(r"forget (all |the )?(previous|prior|above|earlier) (instructions?|context|prompts?|rules?)", re.IGNORECASE), 0.80),
+    ("instruction_override", re.compile(r"do not follow (the )?(previous|prior|above|original) (instructions?|rules?|guidelines?)", re.IGNORECASE), 0.80),
+    ("instruction_override", re.compile(r"override (all |the )?(previous|prior|existing|current) (instructions?|rules?|policies?|guidelines?)", re.IGNORECASE), 0.80),
+    ("new_instruction", re.compile(r"(new|updated|revised|replacement) (instructions?|directives?|rules?|guidelines?)\s*:", re.IGNORECASE), 0.70),
+    ("new_instruction", re.compile(r"your (new|actual|real|true) (task|instructions?|objective|purpose|mission|goal) (is|are)\b", re.IGNORECASE), 0.75),
+    ("new_instruction", re.compile(r"from now on,?\s+(you (should|must|will|shall)|always|never)", re.IGNORECASE), 0.70),
+    ("new_instruction", re.compile(r"instead,?\s+(you (should|must|will)|do the following|follow these)", re.IGNORECASE), 0.65),
+    ("fake_role_assertion", re.compile(r"you are now\b", re.IGNORECASE), 0.70),
+    ("fake_role_assertion", re.compile(r"(act|behave|operate|function|respond) as\s+(if you were |though you are |a |an |the )", re.IGNORECASE), 0.65),
+    ("fake_role_assertion", re.compile(r"(pretend|imagine|assume|suppose) (that )?you('re| are) (a |an |the )?", re.IGNORECASE), 0.70),
+    ("fake_role_assertion", re.compile(r"switch(ing)? (to|into) (a |an )?(\w+ )?mode", re.IGNORECASE), 0.60),
+    ("fake_system_marker", re.compile(r"\b(SYSTEM|ADMIN|ROOT|SUPERUSER|DEVELOPER)\s*(PROMPT|MESSAGE|INSTRUCTION|OVERRIDE|COMMAND)?\s*:", re.IGNORECASE), 0.60),
+    ("fake_system_marker", re.compile(r"\[SYSTEM\]|\[ADMIN\]|\[INTERNAL\]|\[OVERRIDE\]", re.IGNORECASE), 0.65),
+    ("fake_system_marker", re.compile(r"<\s*system\s*>|<\s*/?\s*instructions?\s*>", re.IGNORECASE), 0.70),
+    ("fake_system_marker", re.compile(r"###\s*(SYSTEM|INTERNAL|ADMIN)\s*(INSTRUCTIONS?|PROMPT|MESSAGE|DIRECTIVE)", re.IGNORECASE), 0.70),
+    ("direct_ai_address", re.compile(r"\b(AI|assistant|agent|model|LLM|GPT|chatbot|bot)\s*[,:]?\s*(when|if|please|do not|don't|you (should|must|will))\s+", re.IGNORECASE), 0.75),
+    ("direct_ai_address", re.compile(r"\b(AI|assistant|agent|model|LLM)\s*[,:]?\s*(when|if) you (read|process|see|parse|encounter|find|receive)", re.IGNORECASE), 0.75),
+    ("direct_ai_address", re.compile(r"(dear|attention|note to|message for|hey)\s+(AI|assistant|agent|model|LLM|bot)", re.IGNORECASE), 0.70),
+    ("data_exfiltration", re.compile(r"(send|forward|email|transmit|post|upload|exfiltrate|leak)\s+(this|the|all|any|every)\s+.{0,30}\s+(to|at|via)\s+", re.IGNORECASE), 0.70),
+    ("data_exfiltration", re.compile(r"(include|embed|insert|append|attach)\s+(the |all |this )?(api[- ]?key|password|token|secret|credential|private[- ]?key|access[- ]?key|auth)", re.IGNORECASE), 0.80),
+    ("data_exfiltration", re.compile(r"(output|print|display|reveal|show|expose|dump)\s+(your |the |all )?(system[- ]?prompt|instructions?|hidden|internal|secret|confidential|private)", re.IGNORECASE), 0.75),
+    ("permission_override", re.compile(r"(approve|authorize|allow|permit|grant|accept)\s+(automatically|unconditionally|without|all|any|every)", re.IGNORECASE), 0.70),
+    ("permission_override", re.compile(r"(no|skip|bypass|disable|remove|ignore)\s+(review|verification|validation|approval|check|confirmation|authentication|authorization|oversight)\s+(needed|required|necessary|is needed|is required)", re.IGNORECASE), 0.75),
+    ("permission_override", re.compile(r"(skip|bypass|disable|circumvent|avoid|ignore)\s+(the )?(review|verification|validation|approval|safety|security|check|safeguard|filter)", re.IGNORECASE), 0.70),
+    ("permission_override", re.compile(r"without\s+(any )?(human |manual )?(review|approval|verification|oversight|confirmation|proof|evidence)", re.IGNORECASE), 0.60),
+    ("jailbreak", re.compile(r"(you have no|there are no|remove all|drop all|you don't have any)\s+(restrictions?|limitations?|constraints?|boundaries|guardrails?|rules?|filters?)", re.IGNORECASE), 0.75),
+    ("jailbreak", re.compile(r"(enable|enter|switch to|activate)\s+(unrestricted|developer|debug|god|admin|jailbreak|DAN|evil|uncensored)\s*(mode)?", re.IGNORECASE), 0.80),
+    ("jailbreak", re.compile(r"(in this (hypothetical|fictional|imaginary|simulated|roleplay) scenario|for (educational|research|testing|academic) purposes?),?\s+(you|it is|the)", re.IGNORECASE), 0.55),
+    ("jailbreak", re.compile(r"(this is a test|this is just a test|testing purposes only)\s*(,|\.|\s)?\s*(ignore|bypass|disable|skip)", re.IGNORECASE), 0.70),
+)
+
+_STEGO_TAG_RE = re.compile("[\U000E0000-\U000E007F]{2,}")
+
+# Cyrillic look-alikes of Latin characters (upstream okf-guard detector).
+# NOTE: upstream maps U+0471 ѱ → "ψ" (a Greek letter, not Latin); kept here
+# verbatim for faithfulness — a ѱ in a mixed-script word never matches the
+# basic-Latin range, so it cannot flag on its own.
+_CYRILLIC_HOMOGLYPHS: dict[str, str] = {
+    "\u0430": "a", "\u0435": "e", "\u043E": "o", "\u0440": "p",
+    "\u0441": "c", "\u0445": "x", "\u0443": "y", "\u0456": "i",
+    "\u0458": "j", "\u04BB": "h", "\u0455": "s", "\u0471": "ψ",
+    "\u0410": "A", "\u0412": "B", "\u0415": "E", "\u041A": "K",
+    "\u041C": "M", "\u041D": "H", "\u041E": "O", "\u0420": "P",
+    "\u0421": "C", "\u0422": "T", "\u0425": "X",
+}
+_HOMOGLYPH_WORD_RE = re.compile(r"\S+")
+def scan_injection(text: str) -> List[Dict[str, Any]]:
+    """Screen ``text`` for prompt-injection and encoding tricks (pure, no mutation).
+
+    Three detectors: the vendored phrase bank, Unicode tag-char
+    steganography (runs of ≥2 chars in U+E0000–U+E007F, decoded by
+    subtracting the base code point), and mixed-script Cyrillic/Latin
+    homoglyph words. Flags are sorted by confidence, highest first.
+    """
+    flags: List[Dict[str, Any]] = []
+    for label, pattern, conf in _INJECTION_PATTERNS:
+        for m in pattern.finditer(text):
+            flags.append({
+                "kind": "injection",
+                "label": label,
+                "confidence": conf,
+                "match": m.group()[:60],
+            })
+    for m in _STEGO_TAG_RE.finditer(text):
+        decoded = "".join(chr(ord(ch) - 0xE0000) for ch in m.group())
+        if decoded.strip():
+            flags.append({"kind": "stego", "decoded": decoded, "chars": len(m.group()), "confidence": 0.8})
+    for w in _HOMOGLYPH_WORD_RE.findall(text):
+        # ponytail: naive script-mix heuristic, full word-boundary check if false positives appear
+        if any(ch in _CYRILLIC_HOMOGLYPHS for ch in w) and any("\u0041" <= ch <= "\u007A" for ch in w):
+            flags.append({"kind": "homoglyph", "word": w, "confidence": 0.5})
+    flags.sort(key=lambda f: f["confidence"], reverse=True)
+    return flags
+
+
+# Zero-width / invisible characters smuggled into ingested source text (hidden
+# prompt-injection payloads). Stripped before a concept is written; raw/
+# snapshots keep the original bytes verbatim for provenance. Ranges mirror
+# okf-guard plus small-form/combining marks, mathematical alphanumerics
+# (homoglyph vectors) and Unicode tag characters (steganography vectors):
+# U+200B-200F, U+202A-202E, U+2060, U+FE42, U+1D400-1D7FF, U+E000-F8FF,
+# U+E0000-E007F. Written with ASCII escapes on purpose — the matched points
+# are invisible in source files.
+_UNSAFE_CHARS_RE = re.compile("[\u200B-\u200F\u202A-\u202E\u2060\uFE42\U0001D400-\U0001D7FF\uE000-\uF8FF\U000E0000-\U000E007F]")
+
+def strip_unsafe_chars(text: str) -> tuple[str, int]:
+    """Remove zero-width / invisible characters from ``text``.
+
+    Returns ``(cleaned, count)`` — count is the number of characters removed.
+    """
+    return _UNSAFE_CHARS_RE.subn("", text)
 
 
 def parse_source(text: str) -> Tuple[str | None, List[str], str]:
@@ -323,7 +426,13 @@ def make_concept(
 ) -> Dict[str, Any]:
     """Build a concept dictionary from raw text for :func:`render_concept`."""
     title, tags, body = parse_source(text)
-    body = escape_body_hashtags(body)
+    # Screen the ORIGINAL text (pre-strip) so stego tag chars are still visible
+    # to the detector; the original bytes stay in the raw/ snapshot for provenance.
+    flags = scan_injection((title_override or title or "") + "\n" + (body or ""))
+    body, unsafe_n = strip_unsafe_chars(body)
+    if unsafe_n:
+        log.warning("⚠️  stripped %d zero-width/invisible char(s) from %s concept body (raw/ stays verbatim)",
+                    unsafe_n, source_ref)
     if title_override:
         title = title_override
 
@@ -359,6 +468,9 @@ def make_concept(
         "sources": sources,
         "body": body,
     }
+    if flags:
+        first = "; ".join(f.get("label", f["kind"]) for f in flags[:3])
+        log.warning("⚠️ injection screen: %d flag(s) on %s: %s", len(flags), source_ref, first)
     return concept
 
 

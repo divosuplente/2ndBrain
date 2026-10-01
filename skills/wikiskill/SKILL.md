@@ -1,7 +1,7 @@
 ---
 type: skill
 name: wikiskill
-description: "Evolve agent skills using the WikiSkill loop: co-evolve skills with a persistent knowledge base (wiki) that compounds across iterations. Use when the user wants to iteratively improve a skill from execution experience, optimize skills through automated evolution, or apply WikiSkill's three-layer architecture to skill development."
+description: "Evolve agent skills using the WikiSkill loop: co-evolve skills with a persistent knowledge base (wiki) that compounds across iterations."
 ---
 
 # WikiSkill Skill Evolution Loop

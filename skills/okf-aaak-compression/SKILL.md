@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-aaak-compression
-description: "Compress agent-only skill files using MemPalace AAAK dialect syntax. Triggered when user says 'compress skills', 'apply AAAK', 'optimize skill tokens', or when editing skills/ files for token efficiency. Creates a dual-layer system: SKILL.md (compressed agent view) + SKILL.full.md (verbatim source). Uses section prefixes, pipe-separated concepts, hyphenated words, article-dropping, and a DICT glossary line. NOT lossless — the compressed file is a lossy agent overlay, the .full.md file preserves the original."
+description: "Compress agent-only skill files using MemPalace AAAK dialect syntax."
 ---
 
 # OKF AAAK Compression — Dual-Layer Skill Compression

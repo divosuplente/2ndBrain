@@ -1,7 +1,7 @@
 ---
 type: skill
 name: okf-core
-description: "OKF core operations — base knowledge layer for the OKF brain vault. FORCE-loaded (not discovery-dispatchable) as foundational context for any session working in the OKF repo. Covers the operating contract, visibility rules, tag conventions, link conventions, CLI tools, and domain defaults. Not invocable by user; loaded automatically when okf-* skills are active."
+description: "OKF core operations — base knowledge layer for the OKF brain vault."
 ---
 
 # OKF Core — Operating Model for the Brain Vault
