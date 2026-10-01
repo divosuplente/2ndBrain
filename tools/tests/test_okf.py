@@ -1214,6 +1214,33 @@ def test_export_copies_only_shareable_referenced_attachments(tmp_path, monkeypat
     assert not (out_dir / "raw" / "attachments" / "secret.png").exists()
     assert "2 attachment(s) copied" in out
 
+def test_export_verify_nested_ref_copied_flat(tmp_path, monkeypatch):
+    # regression: copier flattens nested refs (sub/x.png -> attachments/x.png);
+    # verify MUST check the flattened destination or it false-errors "lost"
+    (tmp_path / "concepts" / "tools").mkdir(parents=True)
+    att = tmp_path / "raw" / "attachments" / "sub"
+    att.mkdir(parents=True)
+    (att / "x.png").write_bytes(b"\x89PNG-nested")
+    a = tmp_path / "concepts" / "tools" / "a.md"
+    a.write_text("---\ntype: tool\nvisibility: shareable\ntitle: A Tool\n"
+                 "description: nested\n---\n"
+                 "![img](/raw/attachments/sub/x.png)\n", encoding="utf-8")
+    monkeypatch.setattr(okf, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(okf, "CONCEPTS_DIR", tmp_path / "concepts")
+    out_dir = tmp_path / "bundle"
+    args = okf.build_parser().parse_args(["export", "--out", str(out_dir)])
+    old = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        rc = okf.cmd_export(args)
+    finally:
+        out, sys.stdout = sys.stdout.getvalue(), old
+    assert rc == 0
+    assert "0 lost" in out
+    assert "1 attachment(s) copied" in out
+    assert (out_dir / "raw" / "attachments" / "x.png").exists()
+    assert not (out_dir / "raw" / "attachments" / "sub" / "x.png").exists()
+
 
 # --- affected (transitive backlinks) -------------------------------------------
 

@@ -1766,6 +1766,7 @@ def _verify_bundle(out: Path, shareable):
     dangling = 0
     dead = 0
     att_dir = (out / "raw" / "attachments").resolve()
+    vault_root = (REPO_ROOT / "raw" / "attachments").resolve()
     for c in sorted(shareable, key=lambda c: c.id):
         f = out / c.path.relative_to(REPO_ROOT)
         try:
@@ -1779,16 +1780,17 @@ def _verify_bundle(out: Path, shareable):
         for ref in _ATTACH_REF_RE.findall(c.body):
             links += 1
             name = unquote(ref)
-            vault_root = (REPO_ROOT / "raw" / "attachments").resolve()
             vault_cand = (vault_root / name).resolve()
-            cand = (att_dir / name).resolve()
-            if not cand.is_relative_to(att_dir) or not vault_cand.is_relative_to(vault_root):
+            if not vault_cand.is_relative_to(vault_root):
                 errors.append(f"{c.id}: attachment ref raw/attachments/{name!r} escapes the attachments dir")
-            elif not cand.is_file():
-                if vault_cand.is_file():
-                    errors.append(f"{c.id}: attachment ref raw/attachments/{name!r} is in the vault but not in the bundle")
-                else:
-                    dead += 1  # dead ref in corpus — tolerated, link stays broken in bundle
+            else:
+                # copier flattens: a nested ref (sub/x.png) lands at att_dir/<basename>
+                cand = (att_dir / vault_cand.name).resolve()
+                if not cand.is_file():
+                    if vault_cand.is_file():
+                        errors.append(f"{c.id}: attachment ref raw/attachments/{name!r} is in the vault but not in the bundle")
+                    else:
+                        dead += 1  # dead ref in corpus — tolerated, link stays broken in bundle
         for target in extract_links(c.body, c.id):
             links += 1
             if target not in bundle_ids:
